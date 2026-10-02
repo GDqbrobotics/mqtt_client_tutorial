@@ -1,0 +1,100 @@
+# MQTT Client Configuration File
+# This file contains all settings for the MQTT client.
+# Edit this file to customize your client's behavior.
+
+# =============================================================================
+# CONNECTION SETTINGS
+# =============================================================================
+
+# MQTT Broker address (can be localhost, IP, or domain)
+broker: "localhost"
+
+# Broker port (1883 for MQTT, 8883 for MQTT over TLS)
+port: 1883
+
+# Unique identifier for this client instance
+client_id: "my_app_client_01"
+
+# Username for broker authentication (optional)
+# username: "myuser"
+
+# Password for broker authentication (optional)
+# password: "mypass"
+
+# Keep-alive interval in seconds (0 to disable)
+keepalive: 60
+
+# Clean session: true = start fresh each connection, false = maintain subscriptions
+clean_session: true
+
+# =============================================================================
+# TOPIC CONFIGURATIONS
+# =============================================================================
+
+# List of topics this client will interact with.
+# Each topic has:
+#   - topic: The MQTT topic name (e.g., "sensors/temperature")
+#   - qos: Quality of Service (0=fire and forget, 1=at least once, 2=exactly once)
+#   - retain: Whether to retain messages on the broker
+#   - direction: "send", "receive", or "both"
+#   - message_prefix/suffix: Optional prefix/suffix for formatted messages
+
+topics:
+  # Example 1: Receive temperature readings from sensors
+  - topic: "sensors/temperature/room1"
+    qos: 1
+    retain: false
+    direction: "receive"
+
+  # Example 2: Send control commands to devices
+  - topic: "commands/control/room1"
+    qos: 0
+    retain: false
+    direction: "send"
+
+  # Example 3: Bidirectional communication for status updates
+  - topic: "devices/status"
+    qos: 1
+    retain: true
+    direction: "both"
+    message_prefix: "DEVICE_"
+
+  # Example 4: Receive alerts
+  - topic: "alerts/critical"
+    qos: 2
+    retain: false
+    direction: "receive"
+
+  # Example 5: Log messages with timestamp prefix
+  - topic: "logs/app"
+    qos: 0
+    retain: false
+    direction: "send"
+    message_prefix: "[APP]"
+
+# =============================================================================
+# BEHAVIORAL SETTINGS
+# =============================================================================
+
+# Enable verbose logging to see all messages
+verbose: true
+
+# Reconnection settings (applied when connection is lost)
+reconnect_delay: 5           # Initial delay in seconds
+max_reconnect_attempts: 10   # Maximum reconnection attempts
+
+# =============================================================================
+# ADVANCED SETTINGS (OPTIONAL)
+# =============================================================================
+
+# Custom callbacks for advanced usage
+# on_connect: function to call when connected
+# on_disconnect: function to call when disconnected
+# on_message: function to call when receiving messages
+
+# TLS/SSL configuration (for secure connections)
+# tls:
+#   ca_certs: "/path/to/ca.crt"
+#   certfile: "/path/to/client.crt"
+#   keyfile: "/path/to/client.key"
+#   verify: true

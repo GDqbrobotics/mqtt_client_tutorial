@@ -1,0 +1,46 @@
+# Test Configuration for MQTT Client
+# This configuration is optimized for testing and development scenarios.
+
+# Connection to local broker
+broker: "localhost"
+port: 1883
+client_id: "test_client_01"
+
+# Keep alive set low for quick reconnection testing
+keepalive: 10
+clean_session: true
+
+# Enable verbose output for debugging
+verbose: true
+
+# Topic configurations for testing
+topics:
+  # Test topic for bidirectional communication
+  - topic: "test/bidirectional"
+    qos: 1
+    retain: false
+    direction: "both"
+
+  # Test topic for receiving messages
+  - topic: "test/incoming"
+    qos: 1
+    direction: "receive"
+
+  # Test topic for sending messages
+  - topic: "test/outgoing"
+    qos: 0
+    retain: true
+    direction: "send"
+
+# Reconnection settings for testing network instability
+reconnect_delay: 2
+max_reconnect_attempts: 5
+
+# Advanced: Custom callback examples (commented out)
+# on_connect:
+#   def on_connect(client, userdata, flags, rc):
+#       print(f"Connected with result code {rc}")
+
+# on_message:
+#   def on_message(client, userdata, msg):
+#       print(f"Message received: {msg.payload.decode()}")

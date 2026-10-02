@@ -11,8 +11,11 @@ pip install paho-mqtt pyyaml
 # Run with your config
 python mqtt_client.py --config config.yaml
 
-# Test with an embedded broker (no external broker needed)
+# Spawn a local broker and run the client against it
 python mqtt_client.py --test-with-broker --config config_test.yaml
+
+# Interactive mode: publish messages from the REPL
+python mqtt_client.py --test-with-broker --interactive --config config_test.yaml
 ```
 
 ---

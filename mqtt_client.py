@@ -6,7 +6,7 @@ This module provides an easy-to-use MQTT client that can be integrated into
 your projects with minimal configuration. It supports multiple topics, QoS levels,
 persistent connections, and verbose messaging for debugging.
 
-Author: Pi Coder
+Author: Giuliano Dami
 """
 
 import yaml
@@ -16,6 +16,11 @@ import sys
 import time
 import threading
 import logging
+import subprocess
+import socket
+import shutil
+import tempfile
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Dict, Any
 from datetime import datetime
@@ -412,34 +417,219 @@ def load_config(config_path: str) -> MQTTConfig:
     return config
 
 
-def run_test_with_broker(config: MQTTConfig, test_mode: bool = False) -> None:
+def _start_mosquitto(port: int = 1883) -> Optional[subprocess.Popen]:
     """
-    Run a test scenario with an embedded broker for development.
+    Start a mosquitto broker as a subprocess.
 
-    This is useful for testing the client without needing an external MQTT broker.
+    Returns the Popen object if successful, None if mosquitto is not available.
     """
-    logger.info("Test mode: running with embedded broker")
-    logger.info("Make sure mosquitto is running: 'mosquitto -d' or 'mosquitto -c /etc/mosquitto/mosquitto.conf'")
+    import subprocess
+    import shutil
+    import tempfile
+    import os
 
-    # Create and run the client
-    client = MQTTClient(config)
+def _start_mosquitto(port: int = 1883) -> Optional[subprocess.Popen]:
+    """
+    Start a mosquitto broker as a subprocess.
 
-    if test_mode:
-        # Test publishing
-        logger.info("Publishing test message...")
-        client.publish('test/topic', 'Hello from test client!', qos=1)
+    Returns the Popen object if successful, None if mosquitto is not available.
+    """
+    # Check if mosquitto is available
+    mosquitto_path = shutil.which('mosquitto')
+    if not mosquitto_path:
+        logger.error("mosquitto not found. Please install it: 'sudo apt install mosquitto' or 'brew install mosquitto'")
+        return None
 
-    # Start the client in a separate thread
-    client_thread = threading.Thread(target=lambda: client.start(reconnect=False), daemon=True)
-    client_thread.start()
+    # Create a minimal mosquitto config
+    config_fd, config_path = tempfile.mkstemp(suffix='.conf', prefix='mosquitto_')
+    with os.fdopen(config_fd, 'w') as f:
+        f.write(f"listener {port}\n")
+        f.write("allow_anonymous true\n")
+        f.write("persistence false\n")
+        f.write("log_dest stdout\n")
 
-    # Keep the script running
+    # Start mosquitto in the background
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Stopping test environment...")
+        proc = subprocess.Popen(
+            [mosquitto_path, '-c', config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        logger.info(f"Mosquitto broker started (PID: {proc.pid})")
+        return proc
+    except Exception as e:
+        logger.error(f"Failed to start mosquitto: {e}")
+        return None
+
+
+def _stop_mosquitto(proc: Optional[subprocess.Popen]) -> None:
+    """
+    Stop a mosquitto broker subprocess.
+    """
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        logger.info("Mosquitto broker stopped")
+
+
+def _wait_for_broker(broker_host: str, port: int, timeout: int = 10) -> bool:
+    """Wait for the broker to be ready."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            sock = socket.create_connection((broker_host, port), timeout=1)
+            sock.close()
+            logger.info("Broker is ready")
+            return True
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.5)
+    return False
+
+
+def run_test_with_broker(config: MQTTConfig, interactive: bool = False) -> None:
+    """
+    Spawn a local mosquitto broker and run the client against it.
+
+    The broker is launched automatically and stopped on exit.
+    """
+    logger.info("Starting embedded MQTT broker...")
+    broker_proc = _start_mosquitto(config.port)
+
+    if not broker_proc:
+        logger.error("Could not start broker. Please start mosquitto manually:")
+        logger.error("  mosquitto -d -p 1883")
+        return
+
+    if not _wait_for_broker(config.broker, config.port):
+        logger.error("Broker did not become ready in time")
+        _stop_mosquitto(broker_proc)
+        return
+
+    # Run the client (with optional interactive mode)
+    client = MQTTClient(config)
+    if not client.start():
+        logger.error("Failed to connect to broker")
+        _stop_mosquitto(broker_proc)
+        return
+
+    try:
+        if interactive:
+            _run_interactive(client, config)
+        else:
+            _run_normal_mode(client)
+    finally:
         client.stop()
+        _stop_mosquitto(broker_proc)
+
+
+def _run_interactive(client: MQTTClient, config: MQTTConfig) -> None:
+    """
+    Interactive REPL where the user can publish messages to topics.
+
+    Commands:
+      publish <topic> <message>  - Send a message
+      topics                     - List configured topics
+      stats                     - Show stats
+      help                     - Show help
+      quit                     - Exit
+    """
+    print()
+    print("=" * 70)
+    print("MQTT Interactive Mode")
+    print("=" * 70)
+    print(f"Connected to: {config.broker}:{config.port}")
+    print(f"Client ID: {config.client_id}")
+    print()
+    print("Configured topics:")
+    for t in config.topics:
+        print(f"  - {t.topic} (QoS={t.qos}, {t.direction})")
+    print()
+    print("Commands:")
+    print("  publish <topic> <message>  - Send a message")
+    print("  topics                     - List configured topics")
+    print("  stats                     - Show stats")
+    print("  help                     - Show help")
+    print("  quit                     - Exit")
+    print()
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not line:
+            continue
+
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        if cmd == 'quit' or cmd == 'exit':
+            break
+        elif cmd == 'help':
+            print("Commands:")
+            print("  publish <topic> <message>  - Send a message")
+            print("  topics                     - List configured topics")
+            print("  stats                     - Show stats")
+            print("  quit                     - Exit")
+        elif cmd == 'topics':
+            for t in config.topics:
+                print(f"  - {t.topic} (QoS={t.qos}, {t.direction})")
+        elif cmd == 'stats':
+            stats = client.get_stats()
+            print(f"  Connected: {stats['connected']}")
+            print(f"  Received: {stats['received_count']}")
+            print(f"  Sent: {stats['sent_count']}")
+        elif cmd == 'publish':
+            # Parse: publish <topic> <message>
+            tokens = line.split()
+            if len(tokens) < 3:
+                print("Usage: publish <topic> <message>")
+                continue
+            topic = tokens[1]
+            message = ' '.join(tokens[2:])
+            if client.publish(topic, message):
+                print(f"  Published to '{topic}': {message}")
+            else:
+                print(f"  Failed to publish to '{topic}'")
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Type 'help' for commands")
+
+    print()
+    print("Bye!")
+
+
+def _run_normal_mode(client: MQTTClient) -> None:
+    """
+    Run the client in normal mode (no interactive REPL).
+
+    Displays stats periodically until shutdown.
+    """
+    logger.info("Client running. Press Ctrl+C to stop.")
+
+    shutdown_event = threading.Event()
+
+    def signal_handler(signum, frame):
+        logger.info("Received shutdown signal")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        while not shutdown_event.is_set():
+            stats = client.get_stats()
+            print(f"\rReceived: {stats['received_count']}, Sent: {stats['sent_count']}", end='', flush=True)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.stop()
+        logger.info("Client stopped")
 
 
 if __name__ == '__main__':
@@ -456,7 +646,12 @@ if __name__ == '__main__':
     parser.add_argument(
         '--test-with-broker',
         action='store_true',
-        help='Run a test scenario with an embedded MQTT broker'
+        help='Spawn a local mosquitto broker and run the client against it'
+    )
+    parser.add_argument(
+        '--interactive',
+        action='store_true',
+        help='Enable interactive mode (REPL) to send messages'
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -471,35 +666,17 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    config = load_config(args.config)
+
     if args.test_with_broker:
-        config = load_config(args.config)
-        run_test_with_broker(config, test_mode=True)
+        run_test_with_broker(config, interactive=args.interactive)
     else:
-        config = load_config(args.config)
         client = MQTTClient(config)
-
-        # Handle graceful shutdown
-        shutdown_event = threading.Event()
-
-        def signal_handler(signum, frame):
-            logger.info("Received shutdown signal")
-            shutdown_event.set()
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
-        # Start the client
         if client.start():
-            logger.info(f"Client running. Press Ctrl+C to stop.")
-            logger.info(f"Received messages: 0, Sent messages: 0")
-
             try:
-                while not shutdown_event.is_set():
-                    stats = client.get_stats()
-                    print(f"\rReceived: {stats['received_count']}, Sent: {stats['sent_count']}", end='', flush=True)
-                    time.sleep(5)
-            except KeyboardInterrupt:
-                pass
+                if args.interactive:
+                    _run_interactive(client, config)
+                else:
+                    _run_normal_mode(client)
             finally:
                 client.stop()
-                logger.info("Client stopped")

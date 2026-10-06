@@ -47,7 +47,7 @@ topics:
     direction: "receive"
 
   # Example 2: Send control commands to devices
-  - topic: "commands/control/room1"
+  - topic: "commands/control/hyperspectral"
     qos: 0
     retain: false
     direction: "send"

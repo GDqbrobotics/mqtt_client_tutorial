@@ -41,13 +41,13 @@ clean_session: true
 
 topics:
   # Example 1: Receive temperature readings from sensors
-  - topic: "sensors/temperature/room1"
+  - topic: "vimbax/temperature/room1"
     qos: 1
     retain: false
     direction: "receive"
 
   # Example 2: Send control commands to devices
-  - topic: "commands/control/hyperspectral"
+  - topic: "commands/vimbax"
     qos: 0
     retain: false
     direction: "send"

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Vanta XRF MQTT Application
+VimbaX Camera MQTT Application
 ==========================
 
-Example application for the Vanta XRF instrument that integrates the
+Example application for the VimbaX Camera instrument that integrates the
 ``mqtt_client`` library (see ``mqtt_client.py`` in the project root) to
 expose the instrument state over MQTT.
 
@@ -25,8 +25,9 @@ State machine
 
     * ``initializing``      - starting up, connecting to the instrument
     * ``ready``            - idle, waiting for a "measure" command
-    * ``measuring``        - an XRF acquisition is in progress
+    * ``measuring``        - a camera acquisition is in progress
     * ``measure_complete`` - acquisition finished, result being saved
+    * ``error``            - camera initialization failed
 
 Behaviour
 ---------
@@ -35,8 +36,9 @@ Behaviour
   e.g. ``measure 'sample_01'``) arrives on the *command topic*, the app
   transitions from ``ready`` to ``measuring`` and triggers an acquisition.
 * When the acquisition is taken, the app moves to ``measure_complete`` and
-  saves the measurement to a file named after the object (e.g.
-  ``sample_01.json``), then returns to ``ready``.
+  saves a JPEG frame and JSON metadata under a directory named after the
+  object, then returns to ``ready``. Commands may also include the camera
+  position: ``acquire: sample_01; camera position: [0, 0, 0, 0, 0, 0]``.
 
 Usage
 -----
@@ -44,20 +46,19 @@ Usage
     mosquitto -d -p 1883
 
     # 2. run the application (simulation by default)
-    python vanta_mqtt_app.py
+    python vimbax_mqtt_app.py
 
-    # against a real Vanta instrument (USB / OTG)
-    python vanta_mqtt_app.py --device usb
+        # against a real VimbaX instrument
+    python vimbax_mqtt_app.py --device real
 
-    # or LAN, with an explicit IP
-    python vanta_mqtt_app.py --device lan --ip 192.168.7.2
+VmbPy must be installed with the Vimba X SDK for real-camera mode.
 
     # point at an existing broker / custom topics
-    python vanta_mqtt_app.py --broker 192.168.1.50 --port 1883 \
-        --status-topic vanta/status --command-topic commands/vanta
+    python vimbax_mqtt_app.py --broker 192.168.1.50 --port 1883 \
+        --status-topic vimbax/status --command-topic commands/vimbax
 
 Sending a test command (from another terminal):
-    mosquitto_pub -t "commands/vanta" -m "measure 'sample_01'"
+    mosquitto_pub -t "commands/vimbax" -m "acquire: sample_01; camera position: [0, 0, 0, 0, 0, 0]"
 """
 
 import os
@@ -66,10 +67,12 @@ import json
 import time
 import signal
 import shlex
-import random
+import math
+import re
 import argparse
 import logging
 import threading
+from contextlib import ExitStack
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
@@ -89,19 +92,20 @@ from mqtt_client import MQTTClient, MQTTConfig, TopicConfig  # noqa: E402
 # States
 # ---------------------------------------------------------------------------
 class State(Enum):
-    """The four states of the Vanta XRF application."""
+    """States of the VimbaX Camera application."""
 
     INITIALIZING = "initializing"
     READY = "ready"
     MEASURING = "measuring"
     MEASURE_COMPLETE = "measure_complete"
+    ERROR = "error"
 
 
 # ---------------------------------------------------------------------------
 # Measurer abstraction
 # ---------------------------------------------------------------------------
 class Measurer(ABC):
-    """Abstract backend that performs an XRF measurement."""
+    """Abstract backend that performs a camera acquisition."""
 
     @abstractmethod
     def start(self):
@@ -123,14 +127,14 @@ class SimulatedMeasurer(Measurer):
     """
     A measurer that fakes an acquisition.
 
-    Used as the default so the application runs without any Vanta hardware.
+    Used as the default so the application runs without any VimbaX hardware.
     It mimics a few seconds of acquisition time and returns a small,
     deterministic-looking result payload.
     """
 
-    SAMPLE_ELEMENTS = ("Fe", "Cu", "Zn", "Pb", "As", "Sb", "Hg", "Cd")
-
     def __init__(self, duration: float = 3.0):
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("Simulation duration must be a finite non-negative value")
         self._duration = duration
         self._running = False
 
@@ -138,93 +142,103 @@ class SimulatedMeasurer(Measurer):
         self._running = True
 
     def measure(self, object_name: str):
-        # Simulate the XRF exposure time.
+        # Simulate the Camera exposure time.
         time.sleep(self._duration)
-        elements = {}
-        for el in self.SAMPLE_ELEMENTS:
-            elements[el] = round(random.uniform(0.0, 5.0), 3)
+        import numpy as np
+
         return {
+            "image": np.full((64, 64, 3), 127, dtype=np.uint8),
             "object": object_name,
             "simulated": True,
             "timestamp": datetime.now().isoformat(),
             "duration_s": self._duration,
-            "elements_pct": elements,
         }
 
     def stop(self):
         self._running = False
 
 
-class VantaMeasurer(Measurer):
+class VimbaXSystem(Measurer):
     """
-    Measurer backed by the real Vanta instrument (``vanta_api_client.py``).
-
-    The heavy lifting (WebSocket connect, login, start/stop test, heartbeat,
-    notification parsing) is delegated to :class:`VantaClient`.  This is a
-    best-effort integration: the instrument must be reachable and logged in
-    for an acquisition to complete.
+    VimbaX camera backend
     """
 
-    def __init__(self, connection_type: str = "usb", host: str = None,
-                 timeout: float = 120.0):
-        # Imported lazily so the simulation path has no websocket dependency.
-        from vanta_api_client import VantaClient
-        self._client = VantaClient(connection_type=connection_type, host=host)
+    def __init__(self, camera_id: str = None, timeout: float = 3.0):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Camera timeout must be a finite positive value")
+        self._camera_id = camera_id
         self._timeout = timeout
-        self._result = None
+        self._stack = None
+        self._camera = None
 
     def start(self):
-        host = self._client.discover_device()
-        if not host:
-            raise RuntimeError("Could not discover the Vanta device")
-        if not self._client.connect():
-            raise RuntimeError("Could not connect to the Vanta device")
-        if not self._client.login():
-            raise RuntimeError("Could not log in to the Vanta device")
-        self._client.clear_faults()
+        import importlib
+
+        vmbpy = importlib.import_module("vmbpy")
+
+        stack = ExitStack()
+        try:
+            vmb = stack.enter_context(vmbpy.VmbSystem.get_instance())
+            if self._camera_id:
+                camera = vmb.get_camera_by_id(self._camera_id)
+            else:
+                cameras = vmb.get_all_cameras()
+                if not cameras:
+                    raise RuntimeError("No VimbaX cameras are accessible")
+                camera = cameras[0]
+
+            stack.enter_context(camera)
+            self._camera = camera
+            self._stack = stack
+
+            streams = camera.get_streams()
+            if streams:
+                try:
+                    packet_size = streams[0].GVSPAdjustPacketSize
+                    packet_size.run()
+                    while not packet_size.is_done():
+                        time.sleep(0.01)
+                except (AttributeError, vmbpy.VmbFeatureError):
+                    logging.debug("Packet-size adjustment is unavailable")
+        except BaseException:
+            stack.close()
+            self._camera = None
+            self._stack = None
+            raise
 
     def measure(self, object_name: str):
-        self._result = None
-        if not self._client.start_test():
-            raise RuntimeError("Failed to start the XRF test")
+        if self._camera is None:
+            raise RuntimeError("VimbaX camera is not started")
 
-        # Poll for the result notification (commandId 403 / id 206).
-        deadline = time.time() + self._timeout
-        while self._result is None and time.time() < deadline:
-            self._client._listen_for_notification()
-            self._client.heartbeat()
-            time.sleep(0.2)
+        import importlib
 
-        if self._result is None:
-            # Try to stop the test cleanly before giving up.
-            try:
-                self._client.stop_test()
-            except Exception:
-                pass
-            raise RuntimeError("No result received before timeout")
+        pixel_format = importlib.import_module("vmbpy").PixelFormat
 
-        result = self._result
-        return {
-            "object": object_name,
-            "simulated": False,
-            "timestamp": datetime.now().isoformat(),
-            "result": result,
-        }
-
+        for frame in self._camera.get_frame_generator(
+                limit=1, timeout_ms=int(self._timeout * 1000)):
+            image_frame = frame.convert_pixel_format(pixel_format.Bgr8)
+            image = image_frame.as_opencv_image().copy()
+            return {
+                "image": image,
+                "object": object_name,
+                "camera_id": self._camera.get_id(),
+                "simulated": False,
+                "timestamp": datetime.now().isoformat(),
+            }
+        raise RuntimeError("Camera returned no frame")
+    
     def stop(self):
-        try:
-            if self._client.ws:
-                self._client.ws.close()
-        except Exception:
-            pass
-
+        if self._stack is not None:
+            self._stack.close()
+        self._camera = None
+        self._stack = None
 
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
-class VantaXRFApp:
+class VimbaXCameraApp:
     """
-    MQTT-integrated controller for the Vanta XRF instrument.
+    MQTT-integrated controller for the VimbaX Camera instrument.
 
     Publishes the current state to ``status_topic`` every ``status_interval``
     seconds and reacts to ``measure <object_name>`` commands received on
@@ -247,11 +261,12 @@ class VantaXRFApp:
         self._status_interval = status_interval
         self._complete_hold = complete_hold
 
-        self._client: MQTTClient = None
+        self._client = None
         self._state = State.INITIALIZING
         self._current_object = None
         self._lock = threading.RLock()
         self._running = False
+        self._stop_event = threading.Event()
 
         self._status_thread = None
 
@@ -268,7 +283,13 @@ class VantaXRFApp:
             logging.error("Failed to connect to the MQTT broker")
             return False
 
-        os.makedirs(self._measures_dir, exist_ok=True)
+        try:
+            os.makedirs(self._measures_dir, exist_ok=True)
+        except OSError:
+            self._client.stop()
+            self._client = None
+            raise
+        self._stop_event.clear()
         self._running = True
 
         # Publish the status periodically.
@@ -286,12 +307,13 @@ class VantaXRFApp:
     def stop(self):
         """Stop the status loop, the MQTT client and the measurer."""
         self._running = False
+        self._stop_event.set()
         if self._client:
             self._client.stop()
         try:
             self._measurer.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("Failed to stop camera backend: %s", e)
 
     def run_forever(self):
         """Block until Ctrl+C (used by ``main``)."""
@@ -306,8 +328,7 @@ class VantaXRFApp:
     def _set_state(self, state: State, object_name=None):
         with self._lock:
             self._state = state
-            if object_name is not None or state is not State.READY:
-                self._current_object = object_name
+            self._current_object = object_name
             logging.info("State -> %s", state.value)
 
     def _current_state(self) -> State:
@@ -319,14 +340,15 @@ class VantaXRFApp:
         try:
             self._measurer.start()
             # Give the 'initializing' state a moment to be observed.
-            time.sleep(1.0)
+            if self._stop_event.wait(1.0):
+                return
         except Exception as e:
             logging.error("Initialisation failed: %s", e)
-            self._set_state(State.READY)
+            self._set_state(State.ERROR)
             return
         self._set_state(State.READY)
 
-    def _start_measurement(self, object_name: str):
+    def _start_measurement(self, object_name: str, position=None):
         """READY -> MEASURING (spawn the acquisition worker)."""
         with self._lock:
             if self._state is not State.READY:
@@ -340,23 +362,19 @@ class VantaXRFApp:
         logging.info("Starting measurement of '%s'", object_name)
 
         thread = threading.Thread(
-            target=self._run_measurement, args=(object_name,),
+            target=self._run_measurement, args=(object_name, position),
             daemon=True, name="measure"
         )
         thread.start()
 
-    def _run_measurement(self, object_name: str):
+    def _run_measurement(self, object_name: str, position=None):
         """Perform the acquisition, then MEASURE_COMPLETE -> READY."""
         try:
-            # Block until the measurement is taken.
-            data = self._measurer.measure(object_name)
-
-            # The measurement is now taken.
+            acquisition_data = self._measurer.measure(object_name)
             self._set_state(State.MEASURE_COMPLETE, object_name=object_name)
-            self._save_measurement(object_name, data)
-
-            # Hold briefly in MEASURE_COMPLETE so the state is observable.
-            time.sleep(self._complete_hold)
+            self._save_measurement(object_name, position, acquisition_data)
+            if self._stop_event.wait(self._complete_hold):
+                return
         except Exception as e:
             logging.error("Measurement failed: %s", e)
         finally:
@@ -365,9 +383,9 @@ class VantaXRFApp:
     # -- status publishing --------------------------------------------------
 
     def _status_loop(self):
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             self._publish_status()
-            time.sleep(self._status_interval)
+            self._stop_event.wait(self._status_interval)
 
     def _publish_status(self):
         with self._lock:
@@ -379,11 +397,13 @@ class VantaXRFApp:
             "timestamp": time.time(),
         })
         # qos=1 so the state is reliably delivered.
-        self._client.publish(self._status_topic, payload, qos=1)
+        if self._client is not None:
+            self._client.publish(self._status_topic, payload, qos=1,
+                                 retain=True)
 
     # -- command handling -----------------------------------------------------
 
-    def _on_message(self, client, userdata, msg):
+    def _on_message(self, _client, _userdata, msg):
         """MQTT callback: route incoming commands."""
         if msg.topic != self._command_topic:
             return
@@ -392,41 +412,95 @@ class VantaXRFApp:
         self._handle_command(payload)
 
     def _handle_command(self, payload: str):
-        """Parse ``measure <object_name>`` (name may be quoted / contain spaces)."""
-        try:
-            parts = shlex.split(payload)
-        except ValueError:
-            logging.warning("Could not parse command: %r", payload)
-            return
-        if len(parts) >= 2 and parts[0].lower() == "measure":
-            object_name = parts[1]
-            if object_name:
-                self._start_measurement(object_name)
-            else:
+        """Parse measure/acquire commands and start one camera grab."""
+        position = None
+        if payload.lower().startswith("acquire:"):
+            command, separator, position_command = payload.partition(";")
+            object_name = self._parse_object_name(command[len("acquire:"):])
+            if not object_name:
                 logging.warning("Empty object name in command: %r", payload)
+                return
+            if separator:
+                match = re.fullmatch(
+                    r"\s*camera\s+position\s*:\s*\[([^\]]*)\]\s*",
+                    position_command,
+                    flags=re.IGNORECASE,
+                )
+                if not match:
+                    logging.warning("Invalid camera position in command: %r",
+                                    payload)
+                    return
+                try:
+                    values = [float(value.strip())
+                              for value in match.group(1).split(",")]
+                    if len(values) != 6 or not all(map(math.isfinite, values)):
+                        raise ValueError
+                except ValueError:
+                    logging.warning(
+                        "Camera position must contain six finite numbers: %r",
+                        payload,
+                    )
+                    return
+                position = values
         else:
-            logging.warning("Unrecognised command: %r", payload)
+            try:
+                parts = shlex.split(payload)
+            except ValueError:
+                logging.warning("Could not parse command: %r", payload)
+                return
+            if not parts or parts[0].lower() != "measure" or len(parts) < 2:
+                logging.warning("Unrecognised command: %r", payload)
+                return
+            object_name = " ".join(parts[1:]).strip()
+
+        self._start_measurement(object_name, position)
+
+    @staticmethod
+    def _parse_object_name(value: str) -> str:
+        try:
+            return " ".join(shlex.split(value.strip())).strip()
+        except ValueError:
+            return ""
 
     # -- persistence --------------------------------------------------------
 
-    def _save_measurement(self, object_name: str, data: dict):
-        """Save ``data`` to ``<measures_dir>/<object_name>.json``."""
-        safe = self._safe_filename(object_name)
-        path = os.path.join(self._measures_dir, safe + ".json")
-        try:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2)
-            logging.info("Measurement for '%s' saved to %s", object_name, path)
-        except Exception as e:
-            logging.error("Failed to save measurement for '%s': %s",
-                          object_name, e)
+    def _save_measurement(self, object_name: str, position, acquisition_data):
+        import cv2
+
+        safe_name = self._safe_filename(object_name)
+        output_dir = os.path.join(self._measures_dir, safe_name)
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        basename = "{}_{}".format(safe_name, timestamp)
+        image_path = os.path.join(output_dir, basename + ".jpg")
+        metadata_path = os.path.join(output_dir, basename + ".json")
+
+        image = acquisition_data.get("image")
+        if image is None:
+            raise ValueError("Camera acquisition did not contain an image")
+        if not cv2.imwrite(image_path, image):
+            raise OSError("Failed to write camera image to {}".format(image_path))
+
+        metadata = {
+            key: value for key, value in acquisition_data.items()
+            if key != "image"
+        }
+        metadata.update({
+            "object": object_name,
+            "position": position,
+            "image_file": os.path.basename(image_path),
+        })
+        with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2)
+            metadata_file.write("\n")
+        logging.info("Saved camera measurement to %s and %s",
+                     image_path, metadata_path)
 
     @staticmethod
     def _safe_filename(name: str) -> str:
-        bad = '<>:"/\\|?*'
-        for c in bad:
-            name = name.replace(c, "_")
-        return name.strip() or "measure"
+        safe = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name).strip(" .")
+        return (safe[:128] or "measure")
+        
 
 
 # ---------------------------------------------------------------------------
@@ -444,53 +518,80 @@ def build_mqtt_config(args) -> MQTTConfig:
         from mqtt_client import load_config
         return load_config(args.config)
 
+    status_topic = args.status_topic or "vimbax/status"
+    command_topic = args.command_topic or "commands/vimbax"
     return MQTTConfig(
         broker=args.broker,
         port=args.port,
-        client_id="vanta_xrf_app",
+        client_id="vimbax_cam_app",
         keepalive=60,
         clean_session=True,
         verbose=True,
         topics=[
-            TopicConfig(topic="vanta/status", qos=1, retain=True,
+            TopicConfig(topic=status_topic, qos=1, retain=True,
                         direction="send"),
-            TopicConfig(topic="commands/vanta", qos=1, direction="receive"),
+            TopicConfig(topic=command_topic, qos=1, direction="receive"),
         ],
     )
 
 
+def resolve_topics(args, mqtt_config: MQTTConfig):
+    """Resolve app topics from CLI overrides or the loaded MQTT config."""
+    send_topics = [topic.topic for topic in mqtt_config.topics
+                   if topic.direction in ("send", "both")]
+    receive_topics = [topic.topic for topic in mqtt_config.topics
+                      if topic.direction in ("receive", "both")]
+    status_topic = (args.status_topic or
+                    (send_topics[0] if args.config and send_topics
+                     else "vimbax/status"))
+    command_topic = (args.command_topic or
+                     (receive_topics[0] if args.config and receive_topics
+                      else "commands/vimbax"))
+
+    for topic in mqtt_config.topics:
+        if topic.topic == command_topic:
+            if topic.direction == "send":
+                topic.direction = "both"
+            break
+    else:
+        mqtt_config.topics.append(
+            TopicConfig(topic=command_topic, qos=1, direction="receive")
+        )
+    return status_topic, command_topic
+
+
 def build_measurer(args) -> Measurer:
-    if args.device == "usb":
-        return VantaMeasurer(connection_type="usb", host=args.ip)
-    if args.device == "lan":
-        return VantaMeasurer(connection_type="lan", host=args.ip)
-    # default: simulation
-    return SimulatedMeasurer(duration=args.measure_duration)
+    if args.device == "sim":
+        return SimulatedMeasurer(duration=args.measure_duration)
+    # The real backend is selected explicitly with --device real.
+    return VimbaXSystem(camera_id=args.camera_id, timeout=args.timeout)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Vanta XRF MQTT application (state machine + status pub)")
+        description="VimbaX Camera MQTT application (state machine + status pub)")
     parser.add_argument("--config", default=None,
                         help="Path to a YAML MQTT config file")
     parser.add_argument("--broker", default="localhost",
                         help="MQTT broker address (default: localhost)")
     parser.add_argument("--port", type=int, default=1883,
                         help="MQTT broker port (default: 1883)")
-    parser.add_argument("--status-topic", default="vanta/status",
+    parser.add_argument("--status-topic", default=None,
                         help="Topic used to publish the state")
-    parser.add_argument("--command-topic", default="commands/vanta",
+    parser.add_argument("--command-topic", default=None,
                         help="Topic used to receive 'measure <object>' commands")
     parser.add_argument("--measures-dir", default=os.path.join(SCRIPT_DIR,
                         "measures"),
                         help="Directory where measurements are saved")
-    parser.add_argument("--device", choices=["sim", "usb", "lan"],
+    parser.add_argument("--device", choices=["sim", "real"],
                         default="sim",
                         help="Measurement backend (default: sim)")
-    parser.add_argument("--ip", default=None,
-                        help="Vanta device IP (for --device lan/usb)")
     parser.add_argument("--measure-duration", type=float, default=3.0,
                         help="Simulated acquisition duration in seconds")
+    parser.add_argument("--camera-id", default=None,
+                        help="VimbaX camera ID (default: first accessible camera)")
+    parser.add_argument("--timeout", type=float, default=3.0,
+                        help="Camera frame timeout in seconds")
     return parser.parse_args()
 
 
@@ -511,23 +612,24 @@ def main():
     signal.signal(signal.SIGTERM, _signal_handler)
 
     mqtt_config = build_mqtt_config(args)
+    status_topic, command_topic = resolve_topics(args, mqtt_config)
     measurer = build_measurer(args)
 
-    app = VantaXRFApp(
+    app = VimbaXCameraApp(
         mqtt_config=mqtt_config,
-        status_topic=args.status_topic,
-        command_topic=args.command_topic,
+        status_topic=status_topic,
+        command_topic=command_topic,
         measurer=measurer,
         measures_dir=args.measures_dir,
         status_interval=2.0,
     )
 
     print("=" * 60)
-    print("VANTA XRF MQTT APPLICATION")
+    print("VIMBAX CAMERA MQTT APPLICATION")
     print("=" * 60)
     print(f"  Broker      : {mqtt_config.broker}:{mqtt_config.port}")
-    print(f"  Status topic: {args.status_topic}")
-    print(f"  Command topic: {args.command_topic}")
+    print(f"  Status topic: {status_topic}")
+    print(f"  Command topic: {command_topic}")
     print(f"  Device      : {args.device}")
     print(f"  Measures dir: {args.measures_dir}")
     print("-" * 60)
@@ -537,7 +639,7 @@ def main():
         return 1
 
     print("[+] Application running. Send a command to the broker, e.g.:")
-    print(f"    mosquitto_pub -t '{args.command_topic}' -m \"measure 'sample_01'\"")
+    print(f"    mosquitto_pub -t '{command_topic}' -m \"measure 'sample_01'\"")
     print("    (or just 'measure sample_01')")
     print("-" * 60)
 

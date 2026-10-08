@@ -9,7 +9,7 @@ camera:
 python applications/VimbaX/vimbax_mqtt_app.py --device sim
 ```
 
-For a real camera, install the Vimba X SDK and its VmbPy Python API, then run:
+For a real camera, install the Vimba X API with `pip install '/path/to/vimbax_api/vmbpy-X.Y.Z-py-none-any.whl`, then run:
 
 ```bash
 python applications/VimbaX/vimbax_mqtt_app.py --device real [--camera-id CAMERA_ID]

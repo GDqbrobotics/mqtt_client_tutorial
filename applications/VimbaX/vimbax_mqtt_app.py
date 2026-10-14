@@ -360,7 +360,7 @@ class VimbaXSystem(Measurer):
 
             frame = self._acquire_triggered_frame()
             image_frame = frame.convert_pixel_format(pixel_format.Bgr8)
-            logging.info("Format reçu : %s", frame.get_pixel_format())
+            logging.info("Pixel format : %s", frame.get_pixel_format())
             logging.info(
                 "Dimensions : %s × %s",
                 frame.get_width(), frame.get_height()

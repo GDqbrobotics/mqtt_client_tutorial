@@ -252,7 +252,7 @@ class VimbaXSystem(Measurer):
         except Exception as exc:
             if request is not None:
                 request["error"] = exc
-            logging.exception("Impossible de copier l'image reçue")
+            logging.exception("Copy received image error")
 
         finally:
             try:
@@ -269,7 +269,7 @@ class VimbaXSystem(Measurer):
                 if request is not None:
                     request["error"] = exc
 
-                logging.error("Impossible de remettre le buffer en file : %s", exc)
+                logging.error("Buffer error : %s", exc)
 
             if request is not None:
                 request["event"].set()
@@ -277,7 +277,7 @@ class VimbaXSystem(Measurer):
 
     def _acquire_triggered_frame(self):
         if self._camera is None or not self._camera.is_streaming():
-            raise RuntimeError("Le flux caméra n'est pas démarré")
+            raise RuntimeError("Camera stream unreachable.")
 
         if self._capture_failed:
             raise RuntimeError(

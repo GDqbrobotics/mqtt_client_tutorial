@@ -31,14 +31,17 @@ State machine
 
 Behaviour
 ---------
-* The current state is published to the *status topic* every 2 seconds.
+* The current state is published to the *status topic* every 2 seconds and
+  at once on every change, as JSON:
+  ``{"state": ..., "object": ..., "waypoint": ..., "timestamp": ...}``.
 * When a command of the form ``measure <object_name>`` (optionally quoted,
   e.g. ``measure 'sample_01'``) arrives on the *command topic*, the app
   transitions from ``ready`` to ``measuring`` and triggers an acquisition.
 * When the acquisition is taken, the app moves to ``measure_complete`` and
   saves a JPEG frame and JSON metadata under a directory named after the
   object, then returns to ``ready``. Commands may also include the camera
-  position: ``acquire: sample_01; camera position: [0, 0, 0, 0, 0, 0]``.
+  pose and the waypoint number, repeated in the status:
+  ``acquire: object_3; camera pose: [x, y, z, qx, qy, qz, qw]; waypoint_5``.
 
 Usage
 -----
@@ -55,10 +58,10 @@ VmbPy must be installed with the Vimba X SDK for real-camera mode.
 
     # point at an existing broker / custom topics
     python vimbax_mqtt_app.py --broker 192.168.1.50 --port 1883 \
-        --status-topic vimbax/status --command-topic commands/vimbax
+        --status-topic vimbax/status --command-topic vimbax/commands
 
 Sending a test command (from another terminal):
-    mosquitto_pub -t "commands/vimbax" -m "acquire: sample_01; camera position: [0, 0, 0, 0, 0, 0]"
+    mosquitto_pub -t "vimbax/commands" -m "acquire: object_1; camera pose: [0.4, 0.1, 0.6, 0, 0, 0, 1]; waypoint_1"
 """
 
 import os
@@ -264,6 +267,7 @@ class VimbaXCameraApp:
         self._client = None
         self._state = State.INITIALIZING
         self._current_object = None
+        self._current_waypoint = None
         self._lock = threading.RLock()
         self._running = False
         self._stop_event = threading.Event()
@@ -325,11 +329,15 @@ class VimbaXCameraApp:
 
     # -- state machine -----------------------------------------------------
 
-    def _set_state(self, state: State, object_name=None):
+    def _set_state(self, state: State, object_name=None, waypoint=None):
         with self._lock:
             self._state = state
             self._current_object = object_name
+            self._current_waypoint = waypoint
             logging.info("State -> %s", state.value)
+        # Publish every change at once: a short state (e.g. measure_complete)
+        # could fall between two periodic publications and never be seen.
+        self._publish_status()
 
     def _current_state(self) -> State:
         with self._lock:
@@ -348,7 +356,8 @@ class VimbaXCameraApp:
             return
         self._set_state(State.READY)
 
-    def _start_measurement(self, object_name: str, position=None):
+    def _start_measurement(self, object_name: str, position=None,
+                           waypoint=None):
         """READY -> MEASURING (spawn the acquisition worker)."""
         with self._lock:
             if self._state is not State.READY:
@@ -359,20 +368,28 @@ class VimbaXCameraApp:
                 return
             self._state = State.MEASURING
             self._current_object = object_name
+            self._current_waypoint = waypoint
         logging.info("Starting measurement of '%s'", object_name)
 
         thread = threading.Thread(
-            target=self._run_measurement, args=(object_name, position),
+            target=self._run_measurement,
+            args=(object_name, position, waypoint),
             daemon=True, name="measure"
         )
         thread.start()
 
-    def _run_measurement(self, object_name: str, position=None):
+    def _run_measurement(self, object_name: str, position=None,
+                         waypoint=None):
         """Perform the acquisition, then MEASURE_COMPLETE -> READY."""
+        # Publish 'measuring' from this thread: this method is started from
+        # the MQTT network thread, where a blocking publish must not run.
+        self._publish_status()
         try:
             acquisition_data = self._measurer.measure(object_name)
-            self._set_state(State.MEASURE_COMPLETE, object_name=object_name)
-            self._save_measurement(object_name, position, acquisition_data)
+            self._set_state(State.MEASURE_COMPLETE, object_name=object_name,
+                            waypoint=waypoint)
+            self._save_measurement(object_name, position, waypoint,
+                                   acquisition_data)
             if self._stop_event.wait(self._complete_hold):
                 return
         except Exception as e:
@@ -391,9 +408,11 @@ class VimbaXCameraApp:
         with self._lock:
             state = self._state
             obj = self._current_object
+            waypoint = self._current_waypoint
         payload = json.dumps({
             "state": state.value,
             "object": obj,
+            "waypoint": waypoint,
             "timestamp": time.time(),
         })
         # qos=1 so the state is reliably delivered.
@@ -412,36 +431,46 @@ class VimbaXCameraApp:
         self._handle_command(payload)
 
     def _handle_command(self, payload: str):
-        """Parse measure/acquire commands and start one camera grab."""
+        """Parse measure/acquire commands and start one camera grab.
+
+        acquire: object_3; camera pose: [x, y, z, qx, qy, qz, qw]; waypoint_5
+        The camera pose and the waypoint part are optional.
+        """
         position = None
+        waypoint = None
         if payload.lower().startswith("acquire:"):
-            command, separator, position_command = payload.partition(";")
-            object_name = self._parse_object_name(command[len("acquire:"):])
+            parts = payload.split(";")
+            object_name = self._parse_object_name(parts[0][len("acquire:"):])
             if not object_name:
                 logging.warning("Empty object name in command: %r", payload)
                 return
-            if separator:
-                match = re.fullmatch(
-                    r"\s*camera\s+position\s*:\s*\[([^\]]*)\]\s*",
-                    position_command,
+            for part in parts[1:]:
+                pose_match = re.fullmatch(
+                    r"\s*camera\s+pose\s*:\s*\[([^\]]*)\]\s*",
+                    part,
                     flags=re.IGNORECASE,
                 )
-                if not match:
-                    logging.warning("Invalid camera position in command: %r",
-                                    payload)
+                waypoint_match = re.fullmatch(r"\s*waypoint_(\d+)\s*", part,
+                                              flags=re.IGNORECASE)
+                if pose_match:
+                    try:
+                        values = [float(value.strip())
+                                  for value in pose_match.group(1).split(",")]
+                        if len(values) != 7 or not all(map(math.isfinite, values)):
+                            raise ValueError
+                    except ValueError:
+                        logging.warning(
+                            "Camera pose must contain seven finite numbers "
+                            "(x, y, z, qx, qy, qz, qw): %r", payload,
+                        )
+                        return
+                    position = values
+                elif waypoint_match:
+                    waypoint = int(waypoint_match.group(1))
+                else:
+                    logging.warning("Invalid part %r in command: %r",
+                                    part, payload)
                     return
-                try:
-                    values = [float(value.strip())
-                              for value in match.group(1).split(",")]
-                    if len(values) != 6 or not all(map(math.isfinite, values)):
-                        raise ValueError
-                except ValueError:
-                    logging.warning(
-                        "Camera position must contain six finite numbers: %r",
-                        payload,
-                    )
-                    return
-                position = values
         else:
             try:
                 parts = shlex.split(payload)
@@ -453,7 +482,7 @@ class VimbaXCameraApp:
                 return
             object_name = " ".join(parts[1:]).strip()
 
-        self._start_measurement(object_name, position)
+        self._start_measurement(object_name, position, waypoint)
 
     @staticmethod
     def _parse_object_name(value: str) -> str:
@@ -464,14 +493,18 @@ class VimbaXCameraApp:
 
     # -- persistence --------------------------------------------------------
 
-    def _save_measurement(self, object_name: str, position, acquisition_data):
+    def _save_measurement(self, object_name: str, position, waypoint,
+                          acquisition_data):
         import cv2
 
         safe_name = self._safe_filename(object_name)
         output_dir = os.path.join(self._measures_dir, safe_name)
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
-        basename = "{}_{}".format(safe_name, timestamp)
+        if waypoint is None:
+            basename = "{}_{}".format(safe_name, timestamp)
+        else:
+            basename = "{}_wp_{}".format(safe_name, waypoint)
         image_path = os.path.join(output_dir, basename + ".jpg")
         metadata_path = os.path.join(output_dir, basename + ".json")
 
@@ -488,6 +521,7 @@ class VimbaXCameraApp:
         metadata.update({
             "object": object_name,
             "position": position,
+            "waypoint": waypoint,
             "image_file": os.path.basename(image_path),
         })
         with open(metadata_path, "w", encoding="utf-8") as metadata_file:
@@ -519,7 +553,7 @@ def build_mqtt_config(args) -> MQTTConfig:
         return load_config(args.config)
 
     status_topic = args.status_topic or "vimbax/status"
-    command_topic = args.command_topic or "commands/vimbax"
+    command_topic = args.command_topic or "vimbax/commands"
     return MQTTConfig(
         broker=args.broker,
         port=args.port,
@@ -546,7 +580,7 @@ def resolve_topics(args, mqtt_config: MQTTConfig):
                      else "vimbax/status"))
     command_topic = (args.command_topic or
                      (receive_topics[0] if args.config and receive_topics
-                      else "commands/vimbax"))
+                      else "vimbax/commands"))
 
     for topic in mqtt_config.topics:
         if topic.topic == command_topic:

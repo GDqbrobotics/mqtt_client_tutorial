@@ -71,6 +71,7 @@ import time
 import signal
 import shlex
 import math
+import copy
 import re
 import argparse
 import logging
@@ -115,7 +116,7 @@ class Measurer(ABC):
         """Prepare the backend (connect / login)."""
 
     @abstractmethod
-    def measure(self, object_name: str):
+    def measure(self, object_name: str, exposure_us=None):
         """Block until the measurement for ``object_name`` is taken.
 
         Returns a JSON-serialisable dict describing the measurement.
@@ -144,7 +145,7 @@ class SimulatedMeasurer(Measurer):
     def start(self):
         self._running = True
 
-    def measure(self, object_name: str):
+    def measure(self, object_name: str, exposure_us=None):
         # Simulate the Camera exposure time.
         time.sleep(self._duration)
         import numpy as np
@@ -173,15 +174,29 @@ class VimbaXSystem(Measurer):
         self._timeout = timeout
         self._stack = None
         self._camera = None
+        self._camera_lock = threading.RLock()
+        self._frame_lock = threading.Lock()
+        self._pending_capture = None
+        self._stream_error = None
+        self._capture_failed = False
 
     def start(self):
+        with self._camera_lock:
+            if self._camera is None:
+                self._start_camera()
+
+    def _start_camera(self):
         import importlib
 
         vmbpy = importlib.import_module("vmbpy")
 
         stack = ExitStack()
         try:
-            vmb = stack.enter_context(vmbpy.VmbSystem.get_instance())
+            system = vmbpy.VmbSystem.get_instance()
+            system.set_path_configuration(
+                "/opt/SVS/SVCamKit/SDK/Linux64_x64/cti/libsv_u3v_tl_x64.cti"
+            )
+            vmb = stack.enter_context(system)
             if self._camera_id:
                 camera = vmb.get_camera_by_id(self._camera_id)
             else:
@@ -194,6 +209,17 @@ class VimbaXSystem(Measurer):
             self._camera = camera
             self._stack = stack
 
+            camera.set_pixel_format(vmbpy.PixelFormat.BayerBG12Packed)
+
+            camera.AcquisitionMode.set("Continuous")
+
+            camera.TriggerSelector.set("AcquisitionStart")
+            camera.TriggerMode.set("Off")
+            camera.TriggerSelector.set("FrameStart")
+            camera.TriggerMode.set("Off")
+            camera.TriggerSource.set("Software")
+            camera.TriggerMode.set("On")
+
             streams = camera.get_streams()
             if streams:
                 try:
@@ -203,23 +229,152 @@ class VimbaXSystem(Measurer):
                         time.sleep(0.01)
                 except (AttributeError, vmbpy.VmbFeatureError):
                     logging.debug("Packet-size adjustment is unavailable")
+
+            self._stream_error = None
+            self._capture_failed = False
+
+            camera.start_streaming(handler=self._on_frame, buffer_count=5)
+            stack.callback(camera.stop_streaming)
         except BaseException:
             stack.close()
             self._camera = None
             self._stack = None
             raise
 
-    def measure(self, object_name: str):
+    def _on_frame(self, camera, stream, frame):
+        request = None
+
+        try:
+            with self._frame_lock:
+                request = self._pending_capture
+                self._pending_capture = None
+
+            if request is not None:
+                request["frame"] = copy.deepcopy(frame)
+
+        except Exception as exc:
+            if request is not None:
+                request["error"] = exc
+            logging.exception("Copy received image error")
+
+        finally:
+            try:
+                camera.queue_frame(frame)
+            except Exception as exc:
+                with self._frame_lock:
+                    self._stream_error = exc
+
+                    if self._pending_capture is not None:
+                        pending = self._pending_capture
+                        pending["error"] = exc
+                        pending["event"].set()
+
+                if request is not None:
+                    request["error"] = exc
+
+                logging.error("Buffer error : %s", exc)
+
+            if request is not None:
+                request["event"].set()
+
+
+    def _acquire_triggered_frame(self):
+        if self._camera is None or not self._camera.is_streaming():
+            raise RuntimeError("Camera stream unreachable.")
+
+        if self._capture_failed:
+            raise RuntimeError(
+                "Acquisition failed: restart the program before retrying"
+            )
+
+        request = {
+            "event": threading.Event(),
+            "frame": None,
+            "error": None,
+        }
+
+        exposure_s = float(self._camera.ExposureTime.get()) / 1_000_000
+        wait_timeout = max(self._timeout, exposure_s + 2.0)
+
+        with self._frame_lock:
+            if self._stream_error is not None:
+                raise RuntimeError("Camera stream failed.") from self._stream_error
+
+            self._pending_capture = request
+
+        try:
+            # L'attente est préparée AVANT le déclenchement.
+            self._camera.TriggerSoftware.run()
+
+            if not request["event"].wait(wait_timeout):
+                raise TimeoutError(
+                    f"No images received during the {wait_timeout} seconds "
+                    "following triggering"
+                )
+
+            if request["error"] is not None:
+                raise RuntimeError("Image reception failed") from request["error"]
+
+            return request["frame"]
+
+        except BaseException:
+            self._capture_failed = True
+            raise
+
+        finally:
+            with self._frame_lock:
+                if self._pending_capture is request:
+                    self._pending_capture = None
+
+    def measure(self, object_name: str, exposure_us=None):
         if self._camera is None:
             raise RuntimeError("VimbaX camera is not started")
 
         import importlib
 
-        pixel_format = importlib.import_module("vmbpy").PixelFormat
+        vmbpy = importlib.import_module("vmbpy")
+        pixel_format = vmbpy.PixelFormat
 
-        for frame in self._camera.get_frame_generator(
-                limit=1, timeout_ms=int(self._timeout * 1000)):
+        with self._camera_lock:
+            exposure = self._camera.get_feature_by_name("ExposureTime")
+
+            if exposure_us is not None:
+                minimum, maximum = exposure.get_range()
+
+                if (
+                    not math.isfinite(exposure_us)
+                    or not minimum <= exposure_us <= maximum
+                ):
+                    raise ValueError(
+                        f"Exposition hors limites : {minimum} à {maximum} µs"
+                    )
+
+                try:
+                    auto = self._camera.get_feature_by_name("ExposureAuto")
+                except vmbpy.VmbFeatureError:
+                    auto = None
+
+                if auto is not None:
+                    auto.set("Off")
+
+                exposure.set(exposure_us)
+
+            applied_exposure_us = float(exposure.get())
+
+            frame = self._acquire_triggered_frame()
             image_frame = frame.convert_pixel_format(pixel_format.Bgr8)
+            logging.info("Pixel format : %s", frame.get_pixel_format())
+            logging.info(
+                "Dimensions : %s × %s",
+                frame.get_width(), frame.get_height()
+            )
+
+            try:
+                logging.info("Status : %s", frame.get_status())
+            except ValueError as exc:
+                logging.warning("Unrecognized status : %s", exc)
+
+            raw_bytes = bytes(frame.get_buffer())
             image = image_frame.as_opencv_image().copy()
             return {
                 "image": image,
@@ -227,14 +382,23 @@ class VimbaXSystem(Measurer):
                 "camera_id": self._camera.get_id(),
                 "simulated": False,
                 "timestamp": datetime.now().isoformat(),
+                "raw_bytes": raw_bytes,
+                "raw_pixel_format": frame.get_pixel_format().name,
+                "raw_width": frame.get_width(),
+                "raw_height": frame.get_height(),
+                "raw_size_bytes": len(raw_bytes),
+                "raw_validation": "unverified",
+                "exposure_time_us": applied_exposure_us,
             }
-        raise RuntimeError("Camera returned no frame")
     
     def stop(self):
-        if self._stack is not None:
-            self._stack.close()
-        self._camera = None
-        self._stack = None
+        with self._camera_lock:
+            try:
+                if self._stack is not None:
+                    self._stack.close()
+            finally:
+                self._camera = None
+                self._stack = None
 
 # ---------------------------------------------------------------------------
 # Application
@@ -356,8 +520,7 @@ class VimbaXCameraApp:
             return
         self._set_state(State.READY)
 
-    def _start_measurement(self, object_name: str, position=None,
-                           waypoint=None):
+    def _start_measurement(self, object_name: str, position=None, waypoint=None, exposure_us=None):
         """READY -> MEASURING (spawn the acquisition worker)."""
         with self._lock:
             if self._state is not State.READY:
@@ -372,20 +535,19 @@ class VimbaXCameraApp:
         logging.info("Starting measurement of '%s'", object_name)
 
         thread = threading.Thread(
-            target=self._run_measurement,
-            args=(object_name, position, waypoint),
+            target=self._run_measurement, 
+            args=(object_name, position, waypoint, exposure_us),
             daemon=True, name="measure"
         )
         thread.start()
 
-    def _run_measurement(self, object_name: str, position=None,
-                         waypoint=None):
+    def _run_measurement(self, object_name: str, position=None, waypoint=None, exposure_us=None):
         """Perform the acquisition, then MEASURE_COMPLETE -> READY."""
         # Publish 'measuring' from this thread: this method is started from
         # the MQTT network thread, where a blocking publish must not run.
         self._publish_status()
         try:
-            acquisition_data = self._measurer.measure(object_name)
+            acquisition_data = self._measurer.measure(object_name, exposure_us=exposure_us)
             self._set_state(State.MEASURE_COMPLETE, object_name=object_name,
                             waypoint=waypoint)
             self._save_measurement(object_name, position, waypoint,
@@ -433,9 +595,31 @@ class VimbaXCameraApp:
     def _handle_command(self, payload: str):
         """Parse measure/acquire commands and start one camera grab.
 
-        acquire: object_3; camera pose: [x, y, z, qx, qy, qz, qw]; waypoint_5
+        acquire: object_3; camera pose: [x, y, z, qx, qy, qz, qw]; waypoint_5; exposure_us: exp_time
         The camera pose and the waypoint part are optional.
         """
+        exposure_us = None
+
+        if payload.lower().startswith("acquire:"):
+            match = re.search(
+                r";\s*exposure_us\s*:\s*([^;]+)\s*$",
+                payload,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                try:
+                    exposure_us = float(match.group(1))
+
+                    if not math.isfinite(exposure_us) or exposure_us <= 0:
+                        raise ValueError
+
+                except ValueError:
+                    logging.warning("Temps d'exposition invalide : %r", payload)
+                    return
+
+                payload = payload[:match.start()].rstrip()
+
         position = None
         waypoint = None
         if payload.lower().startswith("acquire:"):
@@ -482,7 +666,7 @@ class VimbaXCameraApp:
                 return
             object_name = " ".join(parts[1:]).strip()
 
-        self._start_measurement(object_name, position, waypoint)
+        self._start_measurement(object_name, position, waypoint, exposure_us)
 
     @staticmethod
     def _parse_object_name(value: str) -> str:
@@ -514,15 +698,20 @@ class VimbaXCameraApp:
         if not cv2.imwrite(image_path, image):
             raise OSError("Failed to write camera image to {}".format(image_path))
 
+        raw_path = os.path.join(output_dir, basename + ".raw")
+        with open(raw_path, "wb") as raw_file:
+            raw_file.write(acquisition_data["raw_bytes"])
+
         metadata = {
             key: value for key, value in acquisition_data.items()
-            if key != "image"
+            if key not in ("image", "raw_bytes")
         }
         metadata.update({
             "object": object_name,
             "position": position,
             "waypoint": waypoint,
             "image_file": os.path.basename(image_path),
+            "raw_file": os.path.basename(raw_path),
         })
         with open(metadata_path, "w", encoding="utf-8") as metadata_file:
             json.dump(metadata, metadata_file, indent=2)
